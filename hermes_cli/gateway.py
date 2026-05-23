@@ -3103,7 +3103,7 @@ def gateway_setup():
 
     print()
     print(color("┌─────────────────────────────────────────────────────────┐", Colors.MAGENTA))
-    print(color("│             ⚕ Gateway Setup                            │", Colors.MAGENTA))
+    print(color("│             [*] Gateway Setup                            │", Colors.MAGENTA))
     print(color("├─────────────────────────────────────────────────────────┤", Colors.MAGENTA))
     print(color("│  Configure messaging platforms and the gateway service. │", Colors.MAGENTA))
     print(color("│  Press Ctrl+C at any time to exit.                     │", Colors.MAGENTA))

@@ -339,33 +339,49 @@ def acquire_scoped_lock(scope: str, identity: str, metadata: Optional[dict[str, 
 
         stale = existing_pid is None
         if not stale:
-            try:
-                os.kill(existing_pid, 0)
-            except (ProcessLookupError, PermissionError):
-                stale = True
-            else:
-                current_start = _get_process_start_time(existing_pid)
-                if (
-                    existing.get("start_time") is not None
-                    and current_start is not None
-                    and current_start != existing.get("start_time")
-                ):
+            if _IS_WINDOWS:
+                # os.kill(pid, 0) is unreliable on Windows (raises SystemError
+                # internally even when wrapped in try/except OSError).
+                # Use Win32 OpenProcess instead.
+                try:
+                    import ctypes
+                    SYNCHRONIZE = 0x00100000
+                    handle = ctypes.windll.kernel32.OpenProcess(SYNCHRONIZE, False, existing_pid)
+                    if handle == 0:
+                        stale = True
+                    else:
+                        ctypes.windll.kernel32.CloseHandle(handle)
+                except Exception:
+                    # Cannot determine — assume stale to avoid deadlock
                     stale = True
-                # Check if process is stopped (Ctrl+Z / SIGTSTP) — stopped
-                # processes still respond to os.kill(pid, 0) but are not
-                # actually running. Treat them as stale so --replace works.
-                if not stale:
-                    try:
-                        _proc_status = Path(f"/proc/{existing_pid}/status")
-                        if _proc_status.exists():
-                            for _line in _proc_status.read_text().splitlines():
-                                if _line.startswith("State:"):
-                                    _state = _line.split()[1]
-                                    if _state in ("T", "t"):  # stopped or tracing stop
-                                        stale = True
-                                    break
-                    except (OSError, PermissionError):
-                        pass
+            else:
+                try:
+                    os.kill(existing_pid, 0)
+                except (ProcessLookupError, PermissionError, OSError, SystemError):
+                    stale = True
+                else:
+                    current_start = _get_process_start_time(existing_pid)
+                    if (
+                        existing.get("start_time") is not None
+                        and current_start is not None
+                        and current_start != existing.get("start_time")
+                    ):
+                        stale = True
+                    # Check if process is stopped (Ctrl+Z / SIGTSTP) — stopped
+                    # processes still respond to os.kill(pid, 0) but are not
+                    # actually running. Treat them as stale so --replace works.
+                    if not stale:
+                        try:
+                            _proc_status = Path(f"/proc/{existing_pid}/status")
+                            if _proc_status.exists():
+                                for _line in _proc_status.read_text().splitlines():
+                                    if _line.startswith("State:"):
+                                        _state = _line.split()[1]
+                                        if _state in ("T", "t"):  # stopped or tracing stop
+                                            stale = True
+                                        break
+                        except (OSError, PermissionError):
+                            pass
         if stale:
             try:
                 lock_path.unlink(missing_ok=True)

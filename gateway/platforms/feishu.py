@@ -18,6 +18,7 @@ Supports:
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import hashlib
 import hmac
 import itertools
@@ -1086,6 +1087,15 @@ class FeishuAdapter(BasePlatformAdapter):
         self._chat_info_cache: Dict[str, Dict[str, Any]] = {}
         self._message_text_cache: Dict[str, Optional[str]] = {}
         self._app_lock_identity: Optional[str] = None
+        # Dedicated executor for blocking lark API calls. Using a private
+        # executor (instead of the event-loop's default) means it won't be
+        # shut down when asyncio.Runner closes the event loop, allowing
+        # in-flight send() calls to complete even during gateway shutdown.
+        self._api_executor: concurrent.futures.ThreadPoolExecutor = (
+            concurrent.futures.ThreadPoolExecutor(
+                max_workers=8, thread_name_prefix="feishu-api"
+            )
+        )
         self._text_batch_state = FeishuBatchState()
         self._pending_text_batches = self._text_batch_state.events
         self._pending_text_batch_tasks = self._text_batch_state.tasks
@@ -1322,6 +1332,25 @@ class FeishuAdapter(BasePlatformAdapter):
         self._persist_seen_message_ids()
         await self._release_app_lock()
 
+        # Shut down the dedicated API executor, waiting for any in-flight
+        # lark API calls (e.g. a send reply) to complete before exiting.
+        executor = self._api_executor
+        if executor is not None:
+            try:
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(
+                    None,
+                    lambda: executor.shutdown(wait=True, cancel_futures=False),
+                )
+            except RuntimeError:
+                # No running loop during teardown — shut down synchronously.
+                try:
+                    executor.shutdown(wait=False)
+                except Exception:
+                    pass
+            except Exception as exc:
+                logger.debug("[Feishu] API executor shutdown error: %s", exc)
+
         self._mark_disconnected()
         logger.info("[Feishu] Disconnected")
 
@@ -1432,7 +1461,7 @@ class FeishuAdapter(BasePlatformAdapter):
             msg_type, payload = self._build_outbound_payload(content)
             body = self._build_update_message_body(msg_type=msg_type, content=payload)
             request = self._build_update_message_request(message_id=message_id, request_body=body)
-            response = await asyncio.to_thread(self._client.im.v1.message.update, request)
+            response = await self._api_call(self._client.im.v1.message.update, request)
             result = self._finalize_send_result(response, "update failed")
             if not result.success and msg_type == "post" and _POST_CONTENT_INVALID_RE.search(result.error or ""):
                 logger.warning("[Feishu] Invalid post update payload rejected by API; falling back to plain text")
@@ -1441,7 +1470,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     content=json.dumps({"text": _strip_markdown_to_plain_text(content)}, ensure_ascii=False),
                 )
                 fallback_request = self._build_update_message_request(message_id=message_id, request_body=fallback_body)
-                fallback_response = await asyncio.to_thread(self._client.im.v1.message.update, fallback_request)
+                fallback_response = await self._api_call(self._client.im.v1.message.update, fallback_request)
                 result = self._finalize_send_result(fallback_response, "update failed")
             if result.success:
                 result.message_id = message_id
@@ -1624,7 +1653,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 image=image_file,
             )
             request = self._build_image_upload_request(body)
-            upload_response = await asyncio.to_thread(self._client.im.v1.image.create, request)
+            upload_response = await self._api_call(self._client.im.v1.image.create, request)
             image_key = self._extract_response_field(upload_response, "image_key")
             if not image_key:
                 return self._response_error_result(
@@ -1740,7 +1769,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
         try:
             request = self._build_get_chat_request(chat_id)
-            response = await asyncio.to_thread(self._client.im.v1.chat.get, request)
+            response = await self._api_call(self._client.im.v1.chat.get, request)
             if not response or getattr(response, "success", lambda: False)() is False:
                 code = getattr(response, "code", "unknown")
                 msg = getattr(response, "msg", "chat lookup failed")
@@ -2109,7 +2138,7 @@ class FeishuAdapter(BasePlatformAdapter):
         # Fetch the target message to verify it was sent by us and to obtain chat context.
         try:
             request = self._build_get_message_request(message_id)
-            response = await asyncio.to_thread(self._client.im.v1.message.get, request)
+            response = await self._api_call(self._client.im.v1.message.get, request)
             if not response or not getattr(response, "success", lambda: False)():
                 return
             items = getattr(getattr(response, "data", None), "items", None) or []
@@ -2267,7 +2296,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 .request_body(body)
                 .build()
             )
-            response = await asyncio.to_thread(self._client.im.v1.message_reaction.create, request)
+            response = await self._api_call(self._client.im.v1.message_reaction.create, request)
             if response and getattr(response, "success", lambda: False)():
                 data = getattr(response, "data", None)
                 return getattr(data, "reaction_id", None)
@@ -2900,7 +2929,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 file_key=image_key,
                 resource_type="image",
             )
-            response = await asyncio.to_thread(self._client.im.v1.message_resource.get, request)
+            response = await self._api_call(self._client.im.v1.message_resource.get, request)
             if not response or not response.success():
                 logger.warning(
                     "[Feishu] Failed to download image %s: %s %s",
@@ -2944,7 +2973,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     file_key=file_key,
                     resource_type=request_type,
                 )
-                response = await asyncio.to_thread(self._client.im.v1.message_resource.get, request)
+                response = await self._api_call(self._client.im.v1.message_resource.get, request)
                 if not response or not response.success():
                     logger.debug(
                         "[Feishu] Resource download failed for %s/%s via type=%s: %s %s",
@@ -3129,7 +3158,7 @@ class FeishuAdapter(BasePlatformAdapter):
             else:
                 id_type = "user_id"
             request = GetUserRequest.builder().user_id(trimmed).user_id_type(id_type).build()
-            response = await asyncio.to_thread(self._client.contact.v3.user.get, request)
+            response = await self._api_call(self._client.contact.v3.user.get, request)
             if not response or not response.success():
                 return None
             user = getattr(getattr(response, "data", None), "user", None)
@@ -3155,7 +3184,7 @@ class FeishuAdapter(BasePlatformAdapter):
             return self._message_text_cache[message_id]
         try:
             request = self._build_get_message_request(message_id)
-            response = await asyncio.to_thread(self._client.im.v1.message.get, request)
+            response = await self._api_call(self._client.im.v1.message.get, request)
             if not response or getattr(response, "success", lambda: False)() is False:
                 code = getattr(response, "code", "unknown")
                 msg = getattr(response, "msg", "message lookup failed")
@@ -3283,7 +3312,7 @@ class FeishuAdapter(BasePlatformAdapter):
             return
         try:
             request = self._build_get_application_request(app_id=self._app_id, lang="en_us")
-            response = await asyncio.to_thread(self._client.application.v6.application.get, request)
+            response = await self._api_call(self._client.application.v6.application.get, request)
             if not response or not response.success():
                 code = getattr(response, "code", None)
                 if code == 99991672:
@@ -3398,7 +3427,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     file=file_obj,
                 )
                 request = self._build_file_upload_request(body)
-                upload_response = await asyncio.to_thread(self._client.im.v1.file.create, request)
+                upload_response = await self._api_call(self._client.im.v1.file.create, request)
             file_key = self._extract_response_field(upload_response, "file_key")
             if not file_key:
                 return self._response_error_result(
@@ -3433,6 +3462,17 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.error("[Feishu] Failed to send file %s: %s", file_path, exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
 
+    async def _api_call(self, func: Any, *args: Any) -> Any:
+        """Run a blocking lark SDK call in the dedicated API executor.
+
+        Unlike ``asyncio.to_thread`` (which uses the event-loop's default
+        executor), this uses ``self._api_executor`` which is *not* shut down
+        when the asyncio runner closes — so in-flight send() calls survive
+        gateway shutdown gracefully.
+        """
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._api_executor, func, *args)
+
     async def _send_raw_message(
         self,
         *,
@@ -3451,7 +3491,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 uuid_value=str(uuid.uuid4()),
             )
             request = self._build_reply_message_request(reply_to, body)
-            return await asyncio.to_thread(self._client.im.v1.message.reply, request)
+            return await self._api_call(self._client.im.v1.message.reply, request)
 
         body = self._build_create_message_body(
             receive_id=chat_id,
@@ -3460,7 +3500,7 @@ class FeishuAdapter(BasePlatformAdapter):
             uuid_value=str(uuid.uuid4()),
         )
         request = self._build_create_message_request("chat_id", body)
-        return await asyncio.to_thread(self._client.im.v1.message.create, request)
+        return await self._api_call(self._client.im.v1.message.create, request)
 
     @staticmethod
     def _response_succeeded(response: Any) -> bool:
